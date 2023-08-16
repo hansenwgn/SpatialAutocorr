@@ -1,0 +1,730 @@
+---
+title: "script"
+output: html_document
+
+---
+
+Spatial Autocorrelation Analysis with Local Indicators of Spatial Autocorrelation (LISA)
+
+In this section we are going to explore patterns of spatially referenced continuous observations using various measures of spatial autocorrelation. Spatial autocorrelation is a measure of similarity between nearby data. 
+
+RQ: Are the values (in this case the density of music venues) similar (or dissimilar) across the wards of London
+
+```{r}
+library(janitor)
+library(sf)
+library(tidyverse)
+#read the ward data in
+LondonWards <- st_read("ESRI/London_Ward.shp")
+```
+```{r}
+LondonWardsMerged <- st_read("ESRI/London_Ward_CityMerged.shp")%>%
+  st_transform(.,27700)
+```
+```{r}
+WardData <- read_csv("https://data.london.gov.uk/download/ward-profiles-and-atlas/772d2d64-e8c6-46cb-86f9-e52b4c7851bc/ward-profiles-excel-version.csv",
+                    locale = locale(encoding = "latin1"),
+                     na = c("NA", "n/a")) %>% 
+  clean_names()
+```
+```{r}
+LondonWardsMerged2 <- LondonWardsMerged %>% 
+  left_join(WardData, 
+            by = c("GSS_CODE" = "new_code"))%>%
+  dplyr::distinct(GSS_CODE, .keep_all = T)%>%
+  dplyr::select(GSS_CODE, ward_name, population_density_persons_per_sq_km_2013,  average_gcse_capped_point_scores_2014, employment_rate_16_64_2011, median_household_income_estimate_2012_13)
+```
+
+Check the CRS
+
+```{r}
+#have a look to check that it's 
+#in the right projection
+st_crs(LondonWardsMerged2)
+```
+```{r}
+# music venues data loading
+
+music_venues <- read_csv("Music_venues_all.csv", na=" ")
+```
+```{r}
+Datatypelist <- music_venues %>% 
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist
+```
+Convert csv to sf object the map
+
+Check whether there are missing values for latitude and longitude in some rows, that we need to take out
+
+```{r}
+points <- music_venues %>%
+  filter(!is.na(longitude))%>%
+
+    st_as_sf(., coords = c("longitude", "latitude"), 
+                   crs = 4326)
+```
+
+Plot the data
+
+```{r}
+library(tmap)
+
+tmap_mode("plot")
+tm_shape(LondonWardsMerged2) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(points) +
+  tm_dots(col = "blue")
+```
+```{r}
+  LondonWardsMerged2 <- LondonWardsMerged2 %>%
+  st_transform(., 4326)
+```
+
+```{r}
+st_crs(LondonWardsMerged2)
+```
+```{r}
+  points <- points %>%
+  st_transform(., 4326)
+```
+
+
+```{r}
+st_crs(points)
+```
+
+
+```{r}
+intersect <- st_intersects(LondonWardsMerged2, points)
+```
+
+We might need to lose the blue plaques that fall outside of London
+
+```{r}
+PointsSub <- points[LondonWardsMerged2,]
+
+tm_shape(LondonWardsMerged2) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(PointsSub) +
+  tm_dots(col = "blue")
+```
+Now we just take the length of each list per polygon and add this as new column…
+
+```{r}
+library(sf)
+points_sf_joined <- LondonWardsMerged2%>%
+  mutate(n = lengths(st_intersects(., PointsSub)))%>%
+  janitor::clean_names()%>%
+  #calculate area
+  mutate(area=st_area(.))%>%
+  #then density of the points per ward
+  mutate(density=n/area)%>%
+  #select density and some other variables 
+  dplyr::select(density, area, ward_name, gss_code, n, average_gcse_capped_point_scores_2014, population_density_persons_per_sq_km_2013, employment_rate_16_64_2011, median_household_income_estimate_2012_13)
+```
+
+How about a quick choropleth map to see how we are getting on…
+
+```{r}
+points_sf_joined2 <- points_sf_joined %>%                    
+  group_by(gss_code) %>%         
+  summarise(density = first(density),
+          wardname= first(ward_name),
+          musiccount= first(n))
+
+tm_shape(points_sf_joined2) +
+    tm_polygons("density",
+        style="jenks",
+        palette="PuOr",
+        midpoint=NA,
+        popup.vars=c("wardname", "density"),
+        title="Music Venues Density") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Music Venues Density",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Weight Matrix
+
+Before being able to calculate Moran’s I and any similar statistics, we need to first define a Wij spatial weights matrix
+
+```{r}
+#install.packages("spdep")
+library(spdep)
+```
+```{r}
+#First calculate the centroids of all Wards in London
+
+coordsW <- points_sf_joined2%>%
+  st_centroid()%>%
+  st_geometry()
+  
+plot(coordsW,axes=TRUE)
+```
+Alternatively instead of using contiguous relationships you can use distance based relationships. This is frequently done with k nearest neighbours in which k is set to the closest observations. e.g. K=3 means the three closest observations.
+
+In the first instance we must create a neighbours list — which is a list of all the neighbours. To do so we will use poly2nb() with the argument queen=T saying we want a to use Queens case. Let’s see a summary of the output
+
+```{r}
+#create a neighbours list
+LWard_nb <- points_sf_joined2 %>%
+  poly2nb(., queen=T)
+```
+
+The output is a neighbour list object hence why i’ve called the object LWard_nb. We can get some summary info and plot the matrix.
+
+```{r}
+summary(LWard_nb)
+```
+Here it is telling us that the average number of neighbours is 5.88. Now let’s plot the neighbours.
+
+```{r}
+#plot them
+plot(LWard_nb, st_geometry(coordsW), col="red")
+#add a map underneath
+plot(points_sf_joined2$geometry, add=T)
+```
+Matrix style
+
+From the weights list we must now make a spatial weight matrix. This makes a matrix the size of the number of neighbourhoods with values indicating if the elements in the rows are a neighbour or not. The style of weight is especially important here:
+
+B is the basic binary coding (1/0)
+W is row standardised (sums over all links to n)
+C is globally standardised (sums over all links to n)
+U is equal to C divided by the number of neighbours (sums over all links to unity)
+S is the variance-stabilizing coding scheme proposed by Tiefelsdorf et al. 1999, p. 167-168 (sums over all links to n).
+To understand this further let’s start with binary.
+
+```{r}
+#create a spatial weights matrix from these weights
+Lward.lw <- LWard_nb %>%
+  nb2mat(., style="B")
+
+sum(Lward.lw)
+```
+
+Summing the binary (1/0) shows that we have 3680 neighbours. Now if we were to do global standardisation this would mean dividing our 625 wards by the total number of neighbours meaning each spatial weight has a value of 0.169.
+
+Alternatively we can do row standardisation where 1 is divided by the sum of the number of neighbours in each row. For example, row 1 here sums to 6, meaning each weight would be 0.166 in row 1 only.
+
+```{r}
+sum(Lward.lw[1,])
+```
+
+Standardisation permits comparable spatial parameters. But you also need to consider geographical features — should a neighbour be a neighbour if there is a river between them?
+
+Autocorrelation
+Now we have defined our Wij matrix, we can calculate the Moran’s I and other associated statistics. However, Moran’s I requires a spatial weight list type object as opposed to matrix, this is simply…
+
+```{r}
+Lward.lw <- LWard_nb %>%
+  nb2listw(., style="C")
+```
+
+Spatial lag and error modes are global models. That’s why we use “C”
+
+Moran's I
+
+Moran’s I test tells us whether we have clustered values (close to 1) or dispersed values (close to -1), we will calculate for the densities rather than raw values (think about why this is?).
+
+```{r}
+I_LWard_Global_Density <- points_sf_joined2 %>%
+  pull(density) %>%
+  as.vector()%>%
+  moran.test(., Lward.lw)
+
+I_LWard_Global_Density
+```
+Geary's C
+
+Geary’s C as well..? This tells us whether similar values or dissimilar values are clustering
+
+```{r}
+C_LWard_Global_Density <- 
+  points_sf_joined2 %>%
+  pull(density) %>%
+  as.vector()%>%
+  geary.test(., Lward.lw)
+
+C_LWard_Global_Density
+```
+Getis Ord
+
+Getis Ord General G…? This tells us whether high or low values are clustering. If G > Expected = High values clustering; if G < expected = low values clustering
+
+```{r}
+G_LWard_Global_Density <- 
+  points_sf_joined2 %>%
+  pull(density) %>%
+  as.vector()%>%
+  globalG.test(., Lward.lw)
+
+G_LWard_Global_Density
+```
+So the global statistics are indicating that we have spatial autocorrelation of Music Venues in London:
+
+Summary
+
+The Moran’s I statistic = 0.45 (remember 1 = clustered, 0 = no pattern, -1 = dispersed) which shows that we have some clustering
+
+The Geary’s C statistic = 0.7 (remember Geary’s C falls between 0 and 2; 1 means no spatial autocorrelation, <1 - positive spatial autocorrelation or similar values clustering, >1 - negative spatial autocorreation or dissimilar values clustering) which shows that similar values are clustering
+
+The General G statistic = G > expected, so high values are tending to cluster.
+
+---------------
+Local Moran's I
+
+We can now also calculate local versions of the Moran’s I statistic (for each Ward) and a Getis Ord statistic to see where we have hot-spots.
+
+Local Moran’s I is:
+
+-The difference between a value and neighbours * the sum of differences between neighbours and the mean
+-Where the the difference between a value and neighbours is divided by the standard deviation (how much values in neighbourhood vary about the mean)
+
+It returns several columns, of most interest is the Z score. A Z-score is how many standard deviations a value is away (above or below) from the mean. This allows us to state if our value is significantly different than expected value at this location considering the neighours.
+
+```{r}
+#use the localmoran function to generate I for each ward in the city
+
+I_LWard_Local_count <- points_sf_joined2 %>%
+  pull(musiccount) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+
+I_LWard_Local_Density <- points_sf_joined2 %>%
+  pull(density) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+
+#what does the output (the localMoran object) look like?
+slice_head(I_LWard_Local_Density, n=5)
+```
+```{r}
+slice_head(I_LWard_Local_count, n=5)
+```
+There are 5 columns of data in I_LWard_Local_Density. We want to copy some of the columns (the I score (column 1) and the z-score standard deviation (column 4)) back into the LondonWards spatialPolygonsDataframe.
+
+```{r}
+points_sf_joined3 <- points_sf_joined2 %>%
+  mutate(music_count_I = as.numeric(I_LWard_Local_count$Ii))%>%
+  mutate(music_count_Iz =as.numeric(I_LWard_Local_count$Z.Ii))%>%
+  mutate(density_I =as.numeric(I_LWard_Local_Density$Ii))%>%
+  mutate(density_Iz =as.numeric(I_LWard_Local_Density$Z.Ii))
+```
+
+Mapping
+
+No we can plot a map of the local Moran’s I outputs.
+
+We’ll set the breaks manually based on the rule that data points >2.58 or <-2.58 standard deviations away from the mean are significant at the 99% level (<1% chance that autocorrelation not present); >1.96 - <2.58 or <-1.96 to >-2.58 standard deviations are significant at the 95% level (<5% change that autocorrelation not present). >1.65 = 90% etc.
+
+```{r}
+# we set the break
+breaks1<-c(-1000,-2.58,-1.96,-1.65,1.65,1.96,2.58,1000)
+```
+
+Now create a new diverging colour brewer palette and reverse the order using rev() (reverse) so higher values correspond to red
+
+```{r}
+library(RColorBrewer)
+MoranColours<- rev(brewer.pal(8, "RdGy"))
+```
+
+Plot on an interactive map
+
+```{r}
+tm_shape(points_sf_joined3) +
+    tm_polygons("music_count_Iz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I Music Venues in London") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+   tm_layout(main.title = "Local Moran's I, Music Venues in London",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+This map shows some areas in the centre of London that have relatively high scores, indicating areas with lots of music venues neighbouring other areas with lots of music venues.
+
+Local Getis Ord
+
+This is a very similar concept to Local Moran’s I except it just returns a z-score…remember that a z-score shows how many standard deviations a value (our value) is away (above or below) from the mean (of the expected values)
+
+The result of Getis Ord analysis is an array of Z-scores, one for each pixel [or polygon], which is the number of standard deviations that the pixel [or polygon] and its neighbors are from the global mean. High Z-scores indicate more intense clustering of high pixel values, indicating hot spots. Low Z-scores indicate more intense clustering of low values, indicating cold spots. Individual pixels with high or low values by themselves might be interesting but not necessarily significant.
+
+```{r}
+Gi_LWard_Local_Density <- points_sf_joined3 %>%
+  pull(density) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+
+head(Gi_LWard_Local_Density)
+```
+Note that because of the differences in Moran’s I and Getis Ord there will be differences between polyogons that are classed as significant.
+
+Add the Getis Ord data to the simple feature. 
+
+```{r}
+points_sf_joined4_Gi <- points_sf_joined3 %>%
+  mutate(density_G = as.numeric(Gi_LWard_Local_Density))
+```
+
+Map the output
+
+```{r}
+library(RColorBrewer)
+
+GIColours<- rev(brewer.pal(8, "RdYlBu"))
+
+#now plot on an interactive map
+tm_shape(points_sf_joined4_Gi) +
+    tm_polygons("density_G",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Gi*, Music Venues in London") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Gi*, Music Venues in London",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+The local Moran’s I and Getis Ord statistics for wards clearly show that the density of music venues in the centre of the city exhibits strong (and positive) spatial autocorrelation, but neither of these maps are very interesting. 
+
+Other variable:
+- population density
+- income
+- employment rate
+- GSCE score
+
+```{r}
+#use head to see what other variables are in the data file
+
+slice_head(points_sf_joined4_Gi, n=2)
+```
+Print out the class of each column
+
+```{r}
+Datatypelist2 <- LondonWardsMerged2 %>% 
+  st_drop_geometry()%>%
+  summarise_all(class) %>%
+  pivot_longer(everything(), 
+               names_to="All_variables", 
+               values_to="Variable_class")
+
+Datatypelist2
+```
+```{r}
+# calculate Moran's I GCSE
+I_LWard_Local_GCSE <- LondonWardsMerged2 %>%
+  arrange(GSS_CODE)%>%
+  pull(average_gcse_capped_point_scores_2014) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+```
+
+```{r}
+# take Moran's I GCSE
+points_sf_joined_gcse <- points_sf_joined4_Gi %>%
+  arrange(gss_code)%>%
+  mutate(GCSE_LocIz = as.numeric(I_LWard_Local_GCSE$Z.Ii))
+```
+
+```{r}
+# Map Local Moran's I, GCSE Scores
+tm_shape(points_sf_joined_gcse) +
+    tm_polygons("GCSE_LocIz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, GCSE Scores") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Moran's I, GCSE Scores",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Getis Ord for GCSE
+
+```{r}
+# calculate Getis Ord GCSE
+G_LWard_Local_GCSE <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%
+  dplyr::pull(average_gcse_capped_point_scores_2014) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+```
+
+```{r}
+# take Getis Ord GCSE
+points_sf_joined_gcse <- points_sf_joined_gcse %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(GCSE_LocGiz = as.numeric(G_LWard_Local_GCSE))
+```
+
+```{r}
+# Map Local Gi*, GCSE Scores
+tm_shape(points_sf_joined_gcse) +
+    tm_polygons("GCSE_LocGiz",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Gi*, GCSE Scores") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Gi*, GCSE Scores",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Variable: population density
+Local Moran's I
+
+```{r}
+# calculate Moran's I population density
+I_LWard_Local_PD <- LondonWardsMerged2 %>%
+  arrange(GSS_CODE)%>%
+  pull(population_density_persons_per_sq_km_2013) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+```
+
+```{r}
+# take Moran's I population density
+points_sf_joined5 <- points_sf_joined_gcse %>%
+  arrange(gss_code)%>%
+  mutate(PD_LocIz = as.numeric(I_LWard_Local_PD$Z.Ii))
+```
+
+```{r}
+# Map Local Moran's I, population density
+tm_shape(points_sf_joined5) +
+    tm_polygons("PD_LocIz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, Population Density") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Moran's I, Population Density",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Getis Ord for population density
+
+```{r}
+# calculate Getis population density
+G_LWard_Local_PD <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%
+  dplyr::pull(population_density_persons_per_sq_km_2013) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+```
+
+```{r}
+# take Getis Ord population density
+points_sf_joined6 <- points_sf_joined5 %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(PD_LocGiz = as.numeric(G_LWard_Local_PD))
+```
+
+```{r}
+# Map Local Gi*, population density
+tm_shape(points_sf_joined6) +
+    tm_polygons("PD_LocGiz",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Local Gi*, Population Density") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Gi*, Population Density",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Variable: employment rate
+Local Moran's I
+
+```{r}
+# calculate Moran's I employment rate
+I_LWard_Local_ER <- LondonWardsMerged2 %>%
+  arrange(GSS_CODE)%>%
+  pull(employment_rate_16_64_2011) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+```
+
+```{r}
+# take Moran's I employment rate
+points_sf_joined7 <- points_sf_joined6 %>%
+  arrange(gss_code)%>%
+  mutate(ER_LocIz = as.numeric(I_LWard_Local_ER$Z.Ii))
+```
+
+```{r}
+# Map Local Moran's I, employment rate
+tm_shape(points_sf_joined7) +
+    tm_polygons("ER_LocIz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, Employment Rate") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Moran's I, Employment Rate",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+
+Getis Ord for employment rate
+
+```{r}
+# calculate Getis employment rate
+G_LWard_Local_ER <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%
+  dplyr::pull(employment_rate_16_64_2011) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+```
+
+```{r}
+# take Getis Ord employment rate
+points_sf_joined8 <- points_sf_joined7 %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(ER_LocGiz = as.numeric(G_LWard_Local_ER))
+```
+
+```{r}
+# Map Local Gi*, employment rate
+tm_shape(points_sf_joined8) +
+    tm_polygons("ER_LocGiz",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Local Gi*, Employment Rate") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Gi*, Employment Rate",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Variable Income
+Local Moran's I
+
+```{r}
+# calculate Moran's I median income
+I_LWard_Local_MI <- LondonWardsMerged2 %>%
+  arrange(GSS_CODE)%>%
+  pull(median_household_income_estimate_2012_13) %>%
+  as.vector()%>%
+  localmoran(., Lward.lw)%>%
+  as_tibble()
+```
+
+```{r}
+# take Moran's I median income
+points_sf_joined9 <- points_sf_joined8 %>%
+  arrange(gss_code)%>%
+  mutate(MI_LocIz = as.numeric(I_LWard_Local_MI$Z.Ii))
+```
+
+```{r}
+# Map Local Moran's I, median income
+tm_shape(points_sf_joined9) +
+    tm_polygons("MI_LocIz",
+        style="fixed",
+        breaks=breaks1,
+        palette=MoranColours,
+        midpoint=NA,
+        title="Local Moran's I, Median Income") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Moran's I, Median Income",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+Getis Ord for median income
+
+```{r}
+# calculate Getis median income
+G_LWard_Local_MI <- LondonWardsMerged2 %>%
+  dplyr::arrange(GSS_CODE)%>%
+  dplyr::pull(median_household_income_estimate_2012_13) %>%
+  as.vector()%>%
+  localG(., Lward.lw)
+```
+
+```{r}
+# take Getis Ord median income
+points_sf_joined10 <- points_sf_joined9 %>%
+  dplyr::arrange(gss_code)%>%
+  dplyr::mutate(MI_LocGiz = as.numeric(G_LWard_Local_MI))
+```
+
+```{r}
+# Map Local Gi*, median income
+tm_shape(points_sf_joined10) +
+    tm_polygons("MI_LocGiz",
+        style="fixed",
+        breaks=breaks1,
+        palette=GIColours,
+        midpoint=NA,
+        title="Gi*, Median Income") +
+  tm_scale_bar(position = c("left", "bottom"),
+               text.size = 0.4) +
+  tm_compass(position = c("right", "top"),
+             text.size = 0.6) + 
+  tm_layout(main.title = "Local Gi*, Median Income",
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,
+            legend.position = c("right", "center"))
+```
+
